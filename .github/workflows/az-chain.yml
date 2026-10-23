@@ -1,0 +1,116 @@
+name: az-chain
+
+# Perpetual Azure-IP lottery: each run draws SIX runner IPs in parallel (6
+# matrix jobs = 6 independent egress addresses), each opens its own reverse
+# tunnel slot (18220-18225) and the VPS judges end-to-end. A winner holds a
+# 6h shift; losers exit in ~4 min. If no winner, the run re-dispatches itself
+# -> testing never stops until a fresh IP is found. Public repo = free.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"   # also every 5 min (belt)
+
+concurrency:
+  group: az-chain
+  cancel-in-progress: true
+
+jobs:
+  draw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 372
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        slot: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Install local SOCKS
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq microsocks >/dev/null
+          nohup microsocks -i 127.0.0.1 -p 1922${{ matrix.slot }} >/dev/null 2>&1 &
+
+      - name: Tunnel slot
+        env:
+          AZEXIT_SSH_KEY: ${{ secrets.AZEXIT_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AZEXIT_SSH_KEY" | base64 -d > ~/.ssh/azexit
+          chmod 600 ~/.ssh/azexit
+          ssh -i ~/.ssh/azexit \
+            -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            -o ExitOnForwardFailure=yes -N -T \
+            -R 127.0.0.1:1822${{ matrix.slot }}:127.0.0.1:1922${{ matrix.slot }} \
+            root@192.53.174.27 &
+          echo $! > tunnel.pid
+          sleep 5
+          kill -0 $(cat tunnel.pid) && echo "tunnel slot ${{ matrix.slot }} up"
+          EGRESS=$(curl -s --max-time 15 https://api.ipify.org)
+          echo "EGRESS=$EGRESS" >> "$GITHUB_ENV"
+
+      - name: VPS judges end-to-end
+        env:
+          AZEXIT_SSH_KEY: ${{ secrets.AZEXIT_SSH_KEY }}
+          TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
+          TG_CHAT: ${{ secrets.AZEXIT_TG_CHAT }}
+        run: |
+          if ssh -i ~/.ssh/azexit -o StrictHostKeyChecking=no root@192.53.174.27 \
+               "bash /opt/agent-gateway/pool/stack/azverify.sh ${{ matrix.slot }}"; then
+            echo "WINNER slot ${{ matrix.slot }}: $EGRESS"
+            curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" \
+              -d text="🟢 AZ WINNER: $EGRESS (slot ${{ matrix.slot }}) - 200 end-to-end, exit utama 6 jam" >/dev/null
+          else
+            echo "dry: $EGRESS"
+            exit 1
+          fi
+
+      - name: Hold shift (winner only)
+        if: success()
+        run: |
+          for i in $(seq 1 140); do
+            sleep 152
+            if ! kill -0 $(cat tunnel.pid) 2>/dev/null; then
+              ssh -i ~/.ssh/azexit -o StrictHostKeyChecking=no \
+                -o ExitOnForwardFailure=yes -N -T \
+                -R 127.0.0.1:1822${{ matrix.slot }}:127.0.0.1:1922${{ matrix.slot }} \
+                root@192.53.174.27 &
+              echo $! > tunnel.pid
+            fi
+          done
+
+      - name: Shift end cleanup (winner only)
+        if: success() && always()
+        env:
+          AZEXIT_SSH_KEY: ${{ secrets.AZEXIT_SSH_KEY }}
+          TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
+          TG_CHAT: ${{ secrets.AZEXIT_TG_CHAT }}
+        run: |
+          ssh -i ~/.ssh/azexit -o StrictHostKeyChecking=no root@192.53.174.27 \
+            "python3 - << 'PY'
+import json
+p='/opt/agent-gateway/pool/stack/config.json'
+c=json.load(open(p))
+c['proxies']=[x for x in c['proxies'] if '1822' not in x or x=='socks5://127.0.0.1:18222']
+json.dump(c,open(p,'w'),indent=2)
+PY" || true
+          curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT" \
+            -d text="🔴 AZ shift habis: $EGRESS. Lottery lanjut." >/dev/null
+
+  chain:
+    needs: draw
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Re-dispatch (keep the lottery spinning when all 6 were dry)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 120
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/az-chain.yml/dispatches" \
+            -d '{"ref":"main"}' && echo "chain re-dispatched"
