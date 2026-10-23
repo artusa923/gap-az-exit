@@ -1,14 +1,14 @@
 name: az-tunnel
 
-# Keeps a fresh Azure egress alive for the VPS engine: a runner opens a reverse
-# SOCKS tunnel to the VPS (port 18222) and runs one real opencode turn to warm
-# the client fingerprint. 6-hour shifts, overlapping by 1 hour; concurrency
-# ensures only one shift at a time. A shift-end Telegram message marks rotation.
+# Azure egress lottery: each run draws a runner IP, verifies it is FRESH with a
+# real opencode turn, and only then holds a 6h reverse-tunnel shift for the VPS
+# engine. A dry IP fails fast so the next hourly run draws a new one. Public
+# repo = unlimited Actions minutes.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */5 * * *"   # every 5 hours (job lives ~6h, overlap covers handoff)
+    - cron: "0 * * * *"   # hourly lottery ticket
 
 concurrency:
   group: az-tunnel
@@ -19,14 +19,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 370
     steps:
-      - name: Start SOCKS proxy + open reverse tunnel to VPS
+      - name: Install opencode + local SOCKS
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          sudo apt-get update -qq && sudo apt-get install -y -qq microsocks >/dev/null
+          nohup microsocks -i 127.0.0.1 -p 19222 >/dev/null 2>&1 &
+
+      - name: Draw the IP and verify it is FRESH (fail fast if dry)
+        env:
+          TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
+          TG_CHAT: ${{ secrets.AZEXIT_TG_CHAT }}
+        run: |
+          EGRESS=$(curl -s --max-time 15 https://api.ipify.org)
+          echo "EGRESS=$EGRESS" >> "$GITHUB_ENV"
+          echo "drawn egress: $EGRESS"
+          if timeout 90 opencode run -m opencode/beam-free "Reply with the single word PONG" > /tmp/warm.txt 2>&1; then
+            echo "IP FRESH - holding shift"
+          else
+            echo "IP DRY - redraw next hour"
+            curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+              -d chat_id="$TG_CHAT" -d text="🎲 AZ draw $EGRESS: kering. Undian baru jam depan." >/dev/null
+            exit 1
+          fi
+
+      - name: Open reverse tunnel to VPS
         env:
           AZEXIT_SSH_KEY: ${{ secrets.AZEXIT_SSH_KEY }}
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq microsocks >/dev/null
-          nohup microsocks -i 127.0.0.1 -p 19222 >/dev/null 2>&1 &
-          EGRESS=$(curl -s --max-time 15 https://api.ipify.org)
-          echo "EGRESS=$EGRESS" >> "$GITHUB_ENV"
           mkdir -p ~/.ssh
           echo "$AZEXIT_SSH_KEY" | base64 -d > ~/.ssh/azexit
           chmod 600 ~/.ssh/azexit
@@ -39,20 +59,14 @@ jobs:
           sleep 5
           kill -0 $(cat tunnel.pid) && echo "tunnel up"
 
-      - name: Warm the real client once (valid fingerprint through this egress)
-        run: |
-          curl -fsSL https://opencode.ai/install | bash
-          export PATH="$HOME/.opencode/bin:$PATH"
-          timeout 120 opencode run -m opencode/beam-free "Reply with the single word PONG" 2>&1 | tail -3 || true
-
-      - name: Report shift start to Telegram
+      - name: Report shift start
         env:
           TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
           TG_CHAT: ${{ secrets.AZEXIT_TG_CHAT }}
         run: |
           curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
             -d chat_id="$TG_CHAT" \
-            -d text="ðŸŸ¢ AZ shift mulai: egress $EGRESS (tunnel 18222 hidup, Â±6 jam)" >/dev/null
+            -d text="🟢 AZ shift LIVE: egress $EGRESS fresh + terverifikasi, tunnel 18222 hidup ±6 jam" >/dev/null
 
       - name: Hold the shift (renew tunnel if it drops)
         run: |
@@ -76,4 +90,4 @@ jobs:
         run: |
           curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
             -d chat_id="$TG_CHAT" \
-            -d text="ðŸ”´ AZ shift selesai: egress $EGRESS turun. Shift baru mulai â‰¤1 jam." >/dev/null
+            -d text="🔴 AZ shift selesai: egress $EGRESS turun. Undian baru jam depan." >/dev/null
