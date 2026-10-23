@@ -7,8 +7,6 @@ name: az-chain
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"
 
 concurrency:
   group: az-chain
