@@ -1,0 +1,79 @@
+name: az-tunnel
+
+# Keeps a fresh Azure egress alive for the VPS engine: a runner opens a reverse
+# SOCKS tunnel to the VPS (port 18222) and runs one real opencode turn to warm
+# the client fingerprint. 6-hour shifts, overlapping by 1 hour; concurrency
+# ensures only one shift at a time. A shift-end Telegram message marks rotation.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"   # every 5 hours (job lives ~6h, overlap covers handoff)
+
+concurrency:
+  group: az-tunnel
+  cancel-in-progress: true
+
+jobs:
+  shift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    steps:
+      - name: Start SOCKS proxy + open reverse tunnel to VPS
+        env:
+          AZEXIT_SSH_KEY: ${{ secrets.AZEXIT_SSH_KEY }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq microsocks >/dev/null
+          nohup microsocks -i 127.0.0.1 -p 19222 >/dev/null 2>&1 &
+          EGRESS=$(curl -s --max-time 15 https://api.ipify.org)
+          echo "EGRESS=$EGRESS" >> "$GITHUB_ENV"
+          mkdir -p ~/.ssh
+          echo "$AZEXIT_SSH_KEY" | base64 -d > ~/.ssh/azexit
+          chmod 600 ~/.ssh/azexit
+          ssh -i ~/.ssh/azexit \
+            -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+            -o ExitOnForwardFailure=yes -N -T \
+            -R 127.0.0.1:18222:127.0.0.1:19222 \
+            root@192.53.174.27 &
+          echo $! > tunnel.pid
+          sleep 5
+          kill -0 $(cat tunnel.pid) && echo "tunnel up"
+
+      - name: Warm the real client once (valid fingerprint through this egress)
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          export PATH="$HOME/.opencode/bin:$PATH"
+          timeout 120 opencode run -m opencode/beam-free "Reply with the single word PONG" 2>&1 | tail -3 || true
+
+      - name: Report shift start to Telegram
+        env:
+          TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
+          TG_CHAT: ${{ secrets.AZEXIT_TG_CHAT }}
+        run: |
+          curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT" \
+            -d text="ðŸŸ¢ AZ shift mulai: egress $EGRESS (tunnel 18222 hidup, Â±6 jam)" >/dev/null
+
+      - name: Hold the shift (renew tunnel if it drops)
+        run: |
+          for i in $(seq 1 138); do
+            sleep 150
+            if ! kill -0 $(cat tunnel.pid) 2>/dev/null; then
+              ssh -i ~/.ssh/azexit \
+                -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+                -o ExitOnForwardFailure=yes -N -T \
+                -R 127.0.0.1:18222:127.0.0.1:19222 \
+                root@192.53.174.27 &
+              echo $! > tunnel.pid
+            fi
+          done
+
+      - name: Report shift end
+        if: always()
+        env:
+          TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
+          TG_CHAT: ${{ secrets.AZEXIT_TG_CHAT }}
+        run: |
+          curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            -d chat_id="$TG_CHAT" \
+            -d text="ðŸ”´ AZ shift selesai: egress $EGRESS turun. Shift baru mulai â‰¤1 jam." >/dev/null
