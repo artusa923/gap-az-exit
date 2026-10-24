@@ -1,26 +1,27 @@
 name: az-chain
 
-# Every run is a winner attempt with the PROVEN path (24 Oct evidence: the
-# runner's direct egress tests 8/8 LIVE hourly, while any tunneled SOCKS exit
-# lands on a stale Azure NAT mapping and is always dry). The runner starts
-# opencode2api on its own direct egress, sanity-checks one real turn, and
-# reverse-exposes the API to the VPS on 127.0.0.1:18231 for ~6 hours. The VPS
-# (and the PC through its tunnel) consume that endpoint. Concurrency collapses
-# overlapping runs; a failed sanity check just ends the run.
+# Parallel winner-take-API: THREE runners attempt the proven direct-egress
+# engine simultaneously; the FIRST whose sanity check passes holds the shift
+# (concurrency + the 18231 bind are naturally exclusive). Failed runners exit
+# in ~2 min. Schedule: every 20 min = ~72 proven-path tickets/day.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "25 * * * *"
+    - cron: "*/20 * * * *"
 
 concurrency:
   group: az-chain
   cancel-in-progress: true
 
 jobs:
-  shift:
+  attempt:
     runs-on: ubuntu-latest
     timeout-minutes: 372
+    strategy:
+      max-parallel: 3
+      matrix:
+        attempt: [1, 2, 3]
     steps:
       - name: Start engine on runner (direct egress)
         run: |
@@ -29,16 +30,16 @@ jobs:
           docker rm -f azengine 2>/dev/null
           docker run -d --name azengine --network host -v /tmp/azengine/config.json:/var/lib/opencode2api/config.json:ro ghcr.io/jasonxu114514/opencode2api:v1.4.3 >/dev/null
           sleep 12
-          CODE=$(curl -s -o /tmp/win.json -w "%{http_code}" --max-time 60 -H "Authorization: Bearer local-test-key" -H "Content-Type: application/json" -d '{"model":"beam-free","messages":[{"role":"user","content":"Reply PONG"}],"max_tokens":8}' http://127.0.0.1:8081/v1/chat/completions)
-          echo "engine sanity: $CODE"
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 -H "Authorization: Bearer local-test-key" -H "Content-Type: application/json" -d '{"model":"beam-free","messages":[{"role":"user","content":"Reply PONG"}],"max_tokens":8}' http://127.0.0.1:8081/v1/chat/completions)
+          echo "sanity: $CODE"
           if [ "$CODE" != "200" ]; then
-            echo "this runner egress is dry - ending"
             exit 1
           fi
           EGRESS=$(curl -s --max-time 15 https://api.ipify.org)
           echo "EGRESS=$EGRESS" >> "$GITHUB_ENV"
 
-      - name: Expose API to VPS + notify
+      - name: Expose API to VPS + notify (winner)
+        if: success()
         env:
           AZEXIT_SSH_KEY: ${{ secrets.AZEXIT_SSH_KEY }}
           TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
@@ -50,10 +51,11 @@ jobs:
           ssh -i ~/.ssh/azexit -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ExitOnForwardFailure=yes -N -T -R 127.0.0.1:18231:127.0.0.1:8081 root@192.53.174.27 &
           echo $! > api.pid
           sleep 5
-          kill -0 $(cat api.pid) && echo "API tunnel up: VPS 18231 -> runner 8081"
+          kill -0 $(cat api.pid) && echo "API tunnel up"
           curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" -d chat_id="$TG_CHAT" -d text="AZ WINNER: $EGRESS - engine LIVE (direct), API via VPS:18231" >/dev/null
 
-      - name: Hold shift
+      - name: Hold shift (winner)
+        if: success()
         run: |
           for i in $(seq 1 140); do
             sleep 152
@@ -64,11 +66,6 @@ jobs:
             fi
           done
 
-      - name: Shift end cleanup
-        if: always()
-        env:
-          TG_TOKEN: ${{ secrets.AZEXIT_TG_TOKEN }}
-          TG_CHAT: ${{ secrets.AZEXIT_TG_CHAT }}
-        run: |
-          docker rm -f azengine 2>/dev/null
-          curl -s -m 15 "https://api.telegram.org/bot$TG_TOKEN/sendMessage" -d chat_id="$TG_CHAT" -d text="AZ shift habis. Undian berikutnya jam depan." >/dev/null
+      - name: Cleanup (winner end)
+        if: success() && always()
+        run: docker rm -f azengine 2>/dev/null || true
